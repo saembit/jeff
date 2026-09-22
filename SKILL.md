@@ -33,7 +33,7 @@ Every decision has tier, provider, model, effort, skill, sandbox, parallel_group
 Run the parallel group at the same time and the serial ones in depends_on order after. For codex subtasks spawn jeff:codex-worker with this prompt, the header first and the subtask text after it.
 
 ```
-JEFF ROUTE tier=<tier> (<tier_name>) provider=codex model=<model> effort=<effort> skill=<skill> sandbox=<sandbox> risk=<risk> require_approval=false confidence=<confidence> fallback=none bin=${CLAUDE_PLUGIN_ROOT}/bin
+JEFF ROUTE tier=<tier> (<tier_name>) provider=codex model=<model> effort=<effort> skill=<skill> sandbox=<sandbox> risk=<risk> require_approval=false confidence=<confidence> fallback=none bin=${CLAUDE_PLUGIN_ROOT}/bin cwd=<repo path>
 
 <subtask description plus file hints>
 ```

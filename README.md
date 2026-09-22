@@ -54,11 +54,12 @@ For local dev symlink the repo at ~/.claude/skills/jeff instead and it loads as 
 - bin/jev-route, subtasks json in and a decision per subtask out
 - bin/jev-verify, task and result in and pass, escalate or blocked out
 - bin/codex-run, wraps codex exec with the tier's model and effort, the sandbox and an output schema
+- bin/jeff-work, runs codex-run then jev-verify, escalates one tier on a miss, keeps every attempt's files and prints the report block
 - lib/registry.json, tiers, thresholds and the skill catalog, this is what Jev reads
 - lib/result.schema.json, the shape every worker has to return
 - SKILL.md, the /jeff skill
 - skills/codex-*, the five codex skills
-- agents/codex-worker.md, bash only subagent that runs codex-run then jev-verify
+- agents/codex-worker.md, bash only subagent that runs jeff-work
 - hooks/route-agent.py, the PreToolUse hook
 - tests/tasks.json and tests/route-eval.py, labeled routing cases and the script that scores them
 

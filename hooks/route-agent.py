@@ -8,7 +8,7 @@ keep their own settings. Codex work gets the subagent swapped to jeff:codex-work
 routing header on the prompt, Claude work gets the model set. The decision is always attached
 as additionalContext. Any error exits 0 with no output so the original call goes through.
 
-Opt in with JEFF_HOOK=on. Put JEFF:PIN in a prompt to leave that call alone.
+Opt in with JEFF_HOOK=on in the env or in ~/.config/jeff/env. Put JEFF:PIN in a prompt to leave that call alone.
 """
 
 from __future__ import annotations
@@ -31,6 +31,8 @@ GENERIC_TYPES = {"", "general-purpose", "claude"}
 MIN_PROMPT_CHARS = 40
 # How long to wait on the router
 ROUTE_TIMEOUT = 25
+# Dotenv file checked for the opt in when the env var isn't set
+ENV_FILE = Path.home() / ".config" / "jeff" / "env"
 
 
 def log(msg: str) -> None:
@@ -94,8 +96,27 @@ def header(d: dict) -> str:
         f"JEFF ROUTE tier={d['tier']} ({d['tier_name']}) provider={d['provider']} model={d['model']} "
         f"effort={d['effort']} skill={d['skill']} sandbox={d['sandbox']} risk={d['risk']} "
         f"require_approval={str(d['require_approval']).lower()} confidence={d['confidence']} "
-        f"fallback={','.join(d['fallback']) or 'none'} bin={ROOT / 'bin'}"
+        f"fallback={','.join(d['fallback']) or 'none'} bin={ROOT / 'bin'} cwd={d.get('cwd', '')}"
     )
+
+
+def hook_enabled() -> bool:
+    """
+    hook_enabled
+    Checks JEFF_HOOK in the env and then in ~/.config/jeff/env since hook shells don't source rc files
+    @return {bool} - true when opted in
+    """
+    # The env var wins when it's set
+    value = os.environ.get("JEFF_HOOK", "")
+    if not value:
+        try:
+            # Fall back to the dotenv file
+            for line in ENV_FILE.read_text().splitlines():
+                if "JEFF_HOOK" in line:
+                    value = line.split("=", 1)[1].strip().strip("'\"")
+        except OSError:
+            value = ""
+    return value.lower() in {"on", "1", "true"}
 
 
 def main() -> int:
@@ -104,8 +125,11 @@ def main() -> int:
     Reads the hook event, routes the prompt and prints the hook output
     @return {int} - always 0
     """
+    # Always note the invocation so a silent hook can be told apart from a disabled one
+    log(f"invoked enabled={hook_enabled()}")
+
     # Opt in only, routing every spawn is too much as a default
-    if os.environ.get("JEFF_HOOK", "").lower() not in {"on", "1", "true"}:
+    if not hook_enabled():
         return 0
 
     try:
@@ -133,6 +157,8 @@ def main() -> int:
     decision = route(prompt, str(event.get("cwd") or ""))
     if decision is None:
         return 0
+    # The worker runs codex in the session's cwd unless the task says otherwise
+    decision["cwd"] = str(event.get("cwd") or "")
 
     # The registry for thresholds and tier lookups
     reg = json.loads((ROOT / "lib" / "registry.json").read_text())
@@ -176,7 +202,10 @@ def main() -> int:
             "additionalContext": f"{head}. {note}",
         }
     }
+    # updatedInput is only applied alongside a decision, allow is what a plain Agent spawn gets anyway
     if updated != tool_input:
+        output["hookSpecificOutput"]["permissionDecision"] = "allow"
+        output["hookSpecificOutput"]["permissionDecisionReason"] = note
         output["hookSpecificOutput"]["updatedInput"] = updated
     json.dump(output, sys.stdout)
     return 0

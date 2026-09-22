@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# jeff-work
+# Runs one task through codex-run, verifies it with jev-verify, escalates one tier on a miss and prints the report block
+#
+# Usage:
+#   jeff-work --tier N [--sandbox read-only|workspace-write] [--cd DIR] [--work DIR] [--timeout SECONDS] - < task.txt
+#   jeff-work --tier N ... "task text"
+#
+# Every attempt keeps its own result.json, verify.json and events.jsonl under the work dir
+
+set -euo pipefail
+
+# Where this script lives, the sibling scripts and the registry
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REGISTRY="$(dirname "$HERE")/lib/registry.json"
+
+# Defaults for every option
+tier="" sandbox="workspace-write" dir="$PWD" work="" timeout_s=1800 task=""
+
+# Print the usage block from the top of this file
+usage() { sed -n '2,9p' "$0" >&2; exit 2; }
+
+# Parse the arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --tier) tier="$2"; shift 2 ;;
+    --sandbox) sandbox="$2"; shift 2 ;;
+    --cd) dir="$2"; shift 2 ;;
+    --work) work="$2"; shift 2 ;;
+    --timeout) timeout_s="$2"; shift 2 ;;
+    -h|--help) usage ;;
+    -) task="$(cat)"; shift ;;
+    -*) echo "jeff-work: unknown option $1" >&2; usage ;;
+    *) task="$1"; shift ;;
+  esac
+done
+
+# A tier and a task are required
+[[ -n "$tier" && -n "$task" ]] || { echo "jeff-work: need --tier and a task" >&2; usage; }
+[[ -d "$dir" ]] || { echo "jeff-work: --cd $dir is not a directory" >&2; exit 2; }
+
+# Work dir for all attempts
+work="${work:-$(mktemp -d "${TMPDIR:-/tmp}/jeff-work.XXXXXX")}"
+mkdir -p "$work"
+printf '%s' "$task" > "$work/task.txt"
+
+# The codex model for a tier from the registry
+model_for() {
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tiers"][int(sys.argv[2])]["codex"]["model"])' "$REGISTRY" "$1"
+}
+
+# Snapshot of the tree before any attempt so the diff only shows what the worker did
+base=""
+before_untracked=""
+if git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  # stash create commits the dirty state without touching the tree, empty when clean
+  base="$(git -C "$dir" stash create 2>/dev/null || true)"
+  [[ -n "$base" ]] || base="HEAD"
+  before_untracked="$(git -C "$dir" ls-files --others --exclude-standard 2>/dev/null || true)"
+fi
+
+# Diff stat of tracked changes since the snapshot plus any new untracked files
+tree_diff() {
+  [[ -n "$base" ]] || { echo ""; return; }
+  local stat new
+  stat="$(git -C "$dir" diff --stat "$base" 2>/dev/null || true)"
+  new="$(comm -13 <(printf '%s\n' "$before_untracked" | sort) <(git -C "$dir" ls-files --others --exclude-standard 2>/dev/null | sort) | sed 's/^/ new file: /')"
+  printf '%s\n%s' "$stat" "$new"
+}
+
+# Runs one attempt at a tier and writes result.json and verify.json into its own dir
+attempt() {
+  local t="$1" adir="$work/t$1"
+  mkdir -p "$adir"
+
+  # Run codex, the exit code is kept in the result's _meta
+  set +e
+  "$HERE/codex-run" --tier "$t" --sandbox "$sandbox" --cd "$dir" --timeout "$timeout_s" --out "$adir/result.json" - < "$work/task.txt" > "$adir/wrapped.json" 2>"$adir/codex-run.stderr"
+  set -e
+
+  # The diff stat when the sandbox could write
+  local diff=""
+  if [[ "$sandbox" == "workspace-write" ]]; then
+    diff="$(tree_diff)"
+  fi
+  printf '%s' "$diff" > "$adir/diff.txt"
+
+  # Verify the wrapped result, a verify failure counts as blocked
+  if ! "$HERE/jev-verify" --task "$task" --result "$adir/wrapped.json" --diff-stat "$diff" --tier "$t" > "$adir/verify.json" 2>"$adir/verify.stderr"; then
+    echo '{"verdict":"blocked","next_tier":null,"flags":["verify_failed"],"signals":{}}' > "$adir/verify.json"
+  fi
+}
+
+# First attempt at the routed tier
+attempt "$tier"
+used="$tier"
+
+# One escalation when verify asks for it
+verdict="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["verdict"])' "$work/t$tier/verify.json")"
+if [[ "$verdict" == "escalate" ]]; then
+  next="$(python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); print("" if v["next_tier"] is None else v["next_tier"])' "$work/t$tier/verify.json")"
+  if [[ -n "$next" ]]; then
+    attempt "$next"
+    used="$next"
+  fi
+fi
+
+# Print the report block from the last attempt's files
+python3 - "$work" "$used" "$(model_for "$used")" <<'PY'
+import json, sys
+from pathlib import Path
+
+# The work dir, the tier that ran last and its model
+work, used, model = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+adir = work / f"t{used}"
+# The wrapped codex result and the verify output
+result = json.loads((adir / "wrapped.json").read_text())
+verify = json.loads((adir / "verify.json").read_text())
+
+# Tests line from the result
+tests = result.get("tests") or {}
+if tests.get("ran"):
+    tests_line = "ran/passed" if tests.get("passed") else "ran/failed"
+else:
+    tests_line = "not run"
+
+# Attempts that ran, for the trail
+attempts = sorted(p.name for p in work.glob("t*") if p.is_dir())
+
+print(f"VERDICT: {verify['verdict']}")
+print(f"TIER_USED: {used} ({model})")
+print(f"ATTEMPTS: {', '.join(attempts)}")
+print(f"FILES: {', '.join(result.get('files_changed') or []) or 'none'}")
+print(f"TESTS: {tests_line}")
+print(f"SUMMARY: {result.get('summary', '')}")
+print(f"NOTES: {result.get('notes') or 'none'}")
+print(f"FLAGS: {', '.join(verify.get('flags') or []) or 'none'}")
+print(f"SIGNALS: {json.dumps(verify.get('signals') or {})}")
+print(f"WORK: {work}")
+PY

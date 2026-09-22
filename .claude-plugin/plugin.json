@@ -8,14 +8,6 @@
     "url": "https://github.com/saembit",
     "email": "austinch20@protonmail.com"
   },
-  "skills": [
-    "./",
-    "./skills"
-  ],
-  "agents": [
-    "./agents/codex-worker.md"
-  ],
-  "hooks": "./hooks/hooks.json",
   "displayName": "jeff",
   "homepage": "https://github.com/saembit/jeff",
   "repository": "https://github.com/saembit/jeff",
@@ -28,5 +20,9 @@
     "jev",
     "multi-model",
     "cost"
+  ],
+  "skills": [
+    "./",
+    "./skills"
   ]
 }
