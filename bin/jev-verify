@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""
+jev-verify
+Checks a worker's result against its task with Jev and says pass, escalate or blocked
+
+Usage:
+  jev-verify --task "text" --result result.json [--diff-stat "..."] [--tier N]
+  jev-verify < {"task": "...", "result": {...}, "diff_stat": "...", "tier": N}
+
+Output is {"verdict": "pass"|"escalate"|"blocked", "next_tier": N|null, "flags": [...],
+"signals": {...}}. The flag review_notes means it passed but the worker left a question
+in its notes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+# Make lib importable no matter where the script is run from
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from jevclient import JevError, ask, load_registry  # noqa: E402
+
+# The four questions asked about every result
+QUESTIONS = {
+    # Did the worker actually finish the task
+    "satisfied": {
+        "type": "noul",
+        "instructions": "Does the worker's result accomplish `task`? Weigh `result.status` heavily: done means the worker believes it finished. Use `result.summary`, `result.files_changed`, `result.tests`, and `diff_stat` (git line counts only, not content) as supporting evidence. Small diffs are fine when the task is small.",
+        "criteria": {
+            "true": "Status is done and the summary describes completing what the task asked, with nothing the task required left out.",
+            "false": "Status is partial, blocked, or failed, or the summary shows a required part of the task was not done.",
+        },
+    },
+    # Did the worker touch things it wasn't asked to
+    "scope_creep": {
+        "type": "noul",
+        "instructions": "Did the worker change things `task` did not ask for, such as renames, reformatting, deletions, or edits to unrelated files? Compare `result.summary`, `result.files_changed`, and `diff_stat` against the task text.",
+    },
+    # Does it need a stronger model rather than a retry
+    "harder_than_briefed": {
+        "type": "noul",
+        "instructions": "Does `result` indicate the task needs a more capable model rather than a retry at the same level? Evidence: `result.needs_escalation` is true, or the notes describe investigation the worker could not complete.",
+    },
+    # Did the worker leave a real question for a person
+    "needs_human": {
+        "type": "noul",
+        "instructions": "Do `result.notes` contain an open question or a decision the worker explicitly could not make and left for a person? An assumption the worker made and stated does not count; only unresolved questions or blocking decisions count.",
+        "criteria": {
+            "true": "Notes ask a question, request a decision, or say the worker could not proceed without one.",
+            "false": "Notes are empty, informational, or state assumptions the worker already acted on.",
+        },
+    },
+}
+
+
+def verify(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    verify
+    Asks Jev the four questions and applies the verify policy from the registry
+    @param payload {dict} - task, result, diff_stat and tier
+    @return {dict} - verdict, next_tier, flags, signals and usage
+    """
+    # The registry and its verify thresholds
+    reg = load_registry()
+    pol = reg["policy"]["verify"]
+    # The task text and the worker result
+    task = payload.get("task")
+    result = payload.get("result")
+    if not task or not isinstance(result, dict):
+        raise JevError("need `task` text and `result` object")
+
+    # The state Jev judges
+    state = {
+        "task": task,
+        "result": result,
+        "diff_stat": payload.get("diff_stat") or "",
+    }
+    # Ask all four at once
+    resp = ask(state, QUESTIONS, registry=reg)
+    a = resp["answers"]
+    # Pull the probabilities out
+    satisfied = float(a["satisfied"]["noul"])
+    creep = float(a["scope_creep"]["noul"])
+    harder = float(a["harder_than_briefed"]["noul"])
+    human = float(a["needs_human"]["noul"])
+
+    # The tier the worker ran at and the highest tier there is
+    tier = payload.get("tier")
+    max_tier = len(reg["tiers"]) - 1
+    # Flags that don't change the verdict
+    flags: list[str] = []
+
+    # Pass when satisfied and not creeping, note a question if there is one
+    if satisfied >= pol["satisfied_min"] and creep <= pol["scope_creep_max"]:
+        verdict, next_tier = "pass", None
+        if human >= pol["needs_human_min"]:
+            flags.append("review_notes")
+    # Blocked when the worker left a real question
+    elif human >= pol["needs_human_min"]:
+        verdict, next_tier = "blocked", None
+    # Escalate one tier, two when it was clearly under briefed
+    elif tier is not None and int(tier) < max_tier:
+        verdict, next_tier = "escalate", int(tier) + (2 if harder >= 0.7 and int(tier) + 2 <= max_tier else 1)
+    # Nowhere left to go
+    else:
+        verdict, next_tier = "blocked", None
+
+    return {
+        "verdict": verdict,
+        "next_tier": next_tier,
+        "flags": flags,
+        "signals": {
+            "satisfied": round(satisfied, 3),
+            "scope_creep": round(creep, 3),
+            "harder_than_briefed": round(harder, 3),
+            "needs_human": round(human, 3),
+        },
+        "usage": resp.get("usage"),
+    }
+
+
+def main() -> int:
+    """
+    main
+    Parses args, builds the payload from flags or stdin and prints the verdict
+    @return {int} - exit code
+    """
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--task")
+    parser.add_argument("--result", help="path to worker result JSON")
+    parser.add_argument("--diff-stat", default="")
+    parser.add_argument("--tier", type=int)
+    args = parser.parse_args()
+
+    try:
+        # Flags build the payload, otherwise read it from stdin
+        if args.task and args.result:
+            payload = {
+                "task": args.task,
+                "result": json.loads(Path(args.result).read_text()),
+                "diff_stat": args.diff_stat,
+                "tier": args.tier,
+            }
+        else:
+            payload = json.load(sys.stdin)
+        out = verify(payload)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"jev-verify: bad input: {exc}", file=sys.stderr)
+        return 2
+    except JevError as exc:
+        print(f"jev-verify: {exc}", file=sys.stderr)
+        return 1
+
+    # Print the verdict as json on stdout
+    json.dump(out, sys.stdout, indent=2)
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

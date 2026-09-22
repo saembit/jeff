@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CodexWorkerResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "summary", "files_changed", "tests", "needs_escalation", "notes"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["done", "partial", "blocked", "failed"],
+      "description": "done = task fully complete and verified; partial = some work done, remainder listed in notes; blocked = could not proceed, reason in notes; failed = attempted and abandoned."
+    },
+    "summary": {
+      "type": "string",
+      "description": "Two to five sentences: what was done and how it was verified."
+    },
+    "files_changed": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Repo-relative paths created, modified, or deleted. Empty for read-only tasks."
+    },
+    "tests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ran", "command", "passed"],
+      "properties": {
+        "ran": { "type": "boolean" },
+        "command": { "type": "string", "description": "Exact command run, or empty string." },
+        "passed": { "type": "boolean" }
+      }
+    },
+    "needs_escalation": {
+      "type": "boolean",
+      "description": "True when the task turned out harder than its brief implied and a stronger model or a human should take over."
+    },
+    "notes": {
+      "type": "string",
+      "description": "Anything the orchestrator must know: remaining work, assumptions made, risks, questions for the user. Empty string if none."
+    }
+  }
+}

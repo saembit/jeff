@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/route-agent.py\"",
+            "timeout": 30,
+            "statusMessage": "Jev routing subagent..."
+          }
+        ]
+      }
+    ]
+  }
+}

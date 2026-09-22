@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# codex-run
+# Runs one subtask through codex exec and prints a json result that matches lib/result.schema.json
+#
+# Usage:
+#   codex-run --tier N | --model M --effort E  [--sandbox read-only|workspace-write]
+#             [--cd DIR] [--timeout SECONDS] [--out FILE] [--log FILE] PROMPT
+#   codex-run ... - < prompt.txt
+#
+# Exit codes: 0 ok, 1 codex failed, 2 usage error, 124 timeout
+
+set -euo pipefail
+
+# Where this script and the plugin root are
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(dirname "$HERE")"
+# The registry with the tier to model mapping
+REGISTRY="$ROOT/lib/registry.json"
+# The schema the worker's final message has to match
+SCHEMA="$ROOT/lib/result.schema.json"
+
+# Defaults for every option
+tier="" model="" effort="" sandbox="" dir="$PWD" timeout_s=1800 out="" log="" prompt=""
+
+# Print the usage block from the top of this file
+usage() { sed -n '2,10p' "$0" >&2; exit 2; }
+
+# Parse the arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --tier) tier="$2"; shift 2 ;;
+    --model) model="$2"; shift 2 ;;
+    --effort) effort="$2"; shift 2 ;;
+    --sandbox) sandbox="$2"; shift 2 ;;
+    --cd) dir="$2"; shift 2 ;;
+    --timeout) timeout_s="$2"; shift 2 ;;
+    --out) out="$2"; shift 2 ;;
+    --log) log="$2"; shift 2 ;;
+    -h|--help) usage ;;
+    -) prompt="$(cat)"; shift ;;
+    --) shift; prompt="${1:-}"; shift || true ;;
+    -*) echo "codex-run: unknown option $1" >&2; usage ;;
+    *) prompt="$1"; shift ;;
+  esac
+done
+
+# A prompt and the codex cli are required
+[[ -n "$prompt" ]] || { echo "codex-run: prompt required" >&2; usage; }
+command -v codex >/dev/null || { echo "codex-run: codex CLI not on PATH" >&2; exit 2; }
+
+# A tier looks up the model and effort in the registry
+if [[ -n "$tier" ]]; then
+  read -r model effort < <(python3 - "$REGISTRY" "$tier" <<'PY'
+import json, sys
+reg = json.load(open(sys.argv[1]))
+t = reg["tiers"][int(sys.argv[2])]["codex"]
+print(t["model"], t["effort"])
+PY
+)
+fi
+
+# Check what we ended up with
+[[ -n "$model" && -n "$effort" ]] || { echo "codex-run: need --tier or both --model and --effort" >&2; usage; }
+sandbox="${sandbox:-workspace-write}"
+case "$sandbox" in read-only|workspace-write) ;; *) echo "codex-run: sandbox must be read-only or workspace-write" >&2; exit 2 ;; esac
+[[ -d "$dir" ]] || { echo "codex-run: --cd $dir is not a directory" >&2; exit 2; }
+
+# Work dir for the result and log, next to --out or a temp dir
+workdir="${out:+$(dirname "$out")}"
+workdir="${workdir:-$(mktemp -d "${TMPDIR:-/tmp}/codex-run.XXXXXX")}"
+mkdir -p "$workdir"
+out="${out:-$workdir/result.json}"
+log="${log:-$workdir/events.jsonl}"
+
+# The instructions wrapped around the task, $prompt is expanded once and not re parsed
+instructions="$(cat <<EOF
+You are a worker subagent. Complete the task below inside the repository at $dir. Do not ask questions; make reasonable assumptions and record them in notes. Do not touch files outside the task's scope. Run the relevant tests if they exist. Your final message must be JSON matching the provided output schema and nothing else.
+
+TASK:
+$prompt
+EOF
+)"
+
+# Run codex with a hard timeout, events go to the log and the last message to $out
+set +e
+timeout --kill-after=30 "$timeout_s" codex exec \
+  -m "$model" \
+  -c "model_reasoning_effort=\"$effort\"" \
+  --sandbox "$sandbox" \
+  -c "approval_policy=\"never\"" \
+  -C "$dir" \
+  --ephemeral \
+  --skip-git-repo-check \
+  --color never \
+  --json \
+  --output-schema "$SCHEMA" \
+  -o "$out" \
+  "$instructions" > "$log" 2>&1
+rc=$?
+set -e
+
+# Timeout gets a failed result with the log path
+if [[ $rc -eq 124 ]]; then
+  echo "{\"status\":\"failed\",\"summary\":\"codex timed out after ${timeout_s}s\",\"files_changed\":[],\"tests\":{\"ran\":false,\"command\":\"\",\"passed\":false},\"needs_escalation\":true,\"notes\":\"log: $log\"}"
+  exit 124
+fi
+
+# No final message gets a failed result too
+if [[ ! -s "$out" ]]; then
+  echo "{\"status\":\"failed\",\"summary\":\"codex exited $rc with no final message\",\"files_changed\":[],\"tests\":{\"ran\":false,\"command\":\"\",\"passed\":false},\"needs_escalation\":true,\"notes\":\"log: $log\"}"
+  exit 1
+fi
+
+# Make sure the final message is json with the required keys, wrap it if not
+python3 - "$out" "$log" "$rc" <<'PY'
+import json, sys
+
+# The result path, log path and codex exit code
+path, log, rc = sys.argv[1], sys.argv[2], int(sys.argv[3])
+# The raw final message
+raw = open(path).read().strip()
+# Keys the schema requires
+required = {"status", "summary", "files_changed", "tests", "needs_escalation", "notes"}
+
+try:
+    # Parse and check the keys
+    data = json.loads(raw)
+    if not isinstance(data, dict) or not required <= data.keys():
+        raise ValueError("missing keys")
+except (ValueError, json.JSONDecodeError):
+    # Wrap plain text so the caller still gets the shape it expects
+    data = {
+        "status": "partial" if rc == 0 else "failed",
+        "summary": raw[:2000],
+        "files_changed": [],
+        "tests": {"ran": False, "command": "", "passed": False},
+        "needs_escalation": rc != 0,
+        "notes": f"final message was not schema JSON; log: {log}",
+    }
+
+# Attach the log path and exit code
+data["_meta"] = {"log": log, "exit_code": rc}
+print(json.dumps(data, indent=2))
+PY
+exit "$rc"

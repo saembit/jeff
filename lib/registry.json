@@ -1,0 +1,97 @@
+{
+  "$comment": "Everything Jev reads is in here, the tier describe text, redo_cost, risk and the skills. Tune the wording here not the scripts",
+  "jev": {
+    "model": "jev-latest",
+    "endpoint": "https://api.typesafe.ai/v1/systemone",
+    "max_state_chars": 60000,
+    "timeout_seconds": 30
+  },
+  "policy": {
+    "provider_preference": "codex",
+    "$provider_preference": "codex | claude | balanced. codex = send anything codex-suitable to codex to save Claude quota. balanced = alternate by tier: T0/T1 codex, T2/T3 claude.",
+    "confidence_floor": 0.6,
+    "confidence_act": 0.85,
+    "codex_suitable_min": 0.7,
+    "independent_min": 0.7,
+    "writes_min": 0.5,
+    "max_parallel_workers": 3,
+    "escalate_max_steps": 2,
+    "verify": {
+      "satisfied_min": 0.7,
+      "scope_creep_max": 0.5,
+      "needs_human_min": 0.7
+    }
+  },
+  "tiers": [
+    {
+      "id": 0,
+      "name": "trivial",
+      "describe": "Trivial mechanical work: rename a symbol, fix a typo, add a docstring, format code, write a commit message, look up where something is defined, list files, apply an obvious one-line fix with no judgment needed.",
+      "claude": {
+        "model": "haiku",
+        "effort": "low"
+      },
+      "codex": {
+        "model": "gpt-5.6-terra",
+        "effort": "low"
+      }
+    },
+    {
+      "id": 1,
+      "name": "routine",
+      "describe": "Routine engineering work with a clear spec: write unit tests for an existing function, implement a small well-defined feature in one or two files, fix a bug whose cause is already known, do a review pass for style and obvious errors, update docs to match code.",
+      "claude": {
+        "model": "sonnet",
+        "effort": "medium"
+      },
+      "codex": {
+        "model": "gpt-5.6-sol",
+        "effort": "medium"
+      }
+    },
+    {
+      "id": 2,
+      "name": "hard",
+      "describe": "Hard work needing investigation and judgment: multi-file refactor, debugging a failure whose cause is unknown, integrating two subsystems, performance work with measurement, a feature that touches data models and their consumers.",
+      "claude": {
+        "model": "opus",
+        "effort": "high"
+      },
+      "codex": {
+        "model": "gpt-6-astra",
+        "effort": "high"
+      }
+    },
+    {
+      "id": 3,
+      "name": "frontier",
+      "describe": "Frontier work: architecture and system design, security-sensitive changes such as auth or crypto or input handling at trust boundaries, novel algorithms, ambiguous or conflicting requirements that need interpretation, anything where a wrong answer is expensive and hard to detect.",
+      "claude": {
+        "model": "fable",
+        "effort": "xhigh"
+      },
+      "codex": {
+        "model": "gpt-6-astra",
+        "effort": "xhigh"
+      }
+    }
+  ],
+  "redo_cost": [
+    "Cheap: result is easy to check at a glance and trivial to redo, such as a rename, a doc edit, a lookup, or a formatting change.",
+    "Moderate: checking needs running tests or reading a diff; redoing costs a few minutes.",
+    "Expensive: a wrong result is hard to detect or costly to unwind, such as data migrations, security logic, public API shape, or anything already depended on by other subtasks."
+  ],
+  "risk": [
+    "Safe and reversible: edits inside the working tree, new files, reads, test runs.",
+    "Moderate: touches config, dependencies, build scripts, CI, or shared interfaces; reversible with effort.",
+    "Destructive or irreversible: deletes data or branches, force-pushes, rewrites history, changes production config or secrets, runs migrations against real data, sends anything external."
+  ],
+  "skills": {
+    "none": "No listed skill fits; the worker should proceed with plain coding-agent behavior.",
+    "codex-quick": "Mechanical edits and lookups done by a cheap Codex model: renames, typos, docstrings, formatting, simple one-line fixes, listing or locating code.",
+    "codex-standard": "Routine implementation by a mid Codex model: unit tests, small features, known-cause bug fixes, doc sync, straightforward refactors within a couple of files.",
+    "codex-deep": "Hard or frontier implementation by the top Codex model at high reasoning: multi-file refactors, unknown-cause debugging, integration, design-heavy features.",
+    "codex-review": "Read-only code review by Codex of a diff, branch, or file set; returns findings, does not edit.",
+    "codex-research": "Read-only investigation by Codex: map a codebase area, trace a call path, summarize how something works, compare options; returns findings JSON, does not edit."
+  }
+}

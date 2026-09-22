@@ -1,0 +1,73 @@
+{
+  "context": {
+    "repo": {
+      "cwd": "/example/webapp",
+      "languages": ["typescript", "python"],
+      "code_files_sampled": 640,
+      "has_tests": true,
+      "git_dirty_files": 0
+    }
+  },
+  "subtasks": [
+    {
+      "id": "t01", "expect_tier": 0, "expect_provider": "codex", "expect_writes": true,
+      "title": "Rename getUserById to fetchUserById",
+      "description": "Rename the function getUserById to fetchUserById across src/ and update all call sites and imports. No behavior change."
+    },
+    {
+      "id": "t02", "expect_tier": 0, "expect_provider": "codex", "expect_writes": false,
+      "title": "Find where sessions are created",
+      "description": "Locate every place in the codebase where a user session object is constructed and report file and line for each."
+    },
+    {
+      "id": "t03", "expect_tier": 1, "expect_provider": "codex", "expect_writes": true,
+      "title": "Unit tests for parseDuration",
+      "description": "Write unit tests for src/utils/parseDuration.ts covering the documented formats (30s, 5m, 2h, 1d, mixed like 1h30m) and invalid input. Use the existing vitest setup."
+    },
+    {
+      "id": "t04", "expect_tier": 1, "expect_provider": "codex", "expect_writes": true,
+      "title": "Fix off-by-one in pagination",
+      "description": "The /api/items endpoint returns 21 items when limit=20 because the slice uses limit+1 for has_more detection but forgets to trim. Fix it and add a regression test."
+    },
+    {
+      "id": "t05", "expect_tier": 2, "expect_provider": "codex", "expect_writes": true,
+      "title": "Intermittent test failure in job queue",
+      "description": "tests/queue/worker.test.ts fails roughly one run in five with 'job processed twice'. Cause unknown. Investigate, find the root cause, and fix it."
+    },
+    {
+      "id": "t06", "expect_tier": 2, "expect_provider": "codex", "expect_writes": true,
+      "title": "Extract billing module",
+      "description": "Move all billing logic currently spread across src/api/orders.ts, src/api/subscriptions.ts, and src/services/stripe.ts into a new src/billing/ module with a clean interface, updating every consumer."
+    },
+    {
+      "id": "t07", "expect_tier": 3, "expect_provider": "codex", "expect_writes": true,
+      "title": "Design multi-tenant data isolation",
+      "description": "Propose and implement row-level tenant isolation across the Postgres schema and the ORM layer so no query can return another tenant's rows, including the reporting queries that currently bypass the ORM."
+    },
+    {
+      "id": "t08", "expect_tier": 3, "expect_provider": "codex", "expect_writes": true,
+      "title": "Harden password reset flow",
+      "description": "Review and fix the password reset flow in src/auth/reset.ts for token reuse, timing attacks, and enumeration. Tokens must be single-use and expire in 15 minutes."
+    },
+    {
+      "id": "t09", "expect_tier": 0, "expect_provider": "claude", "expect_writes": false,
+      "title": "Summarize what we decided",
+      "description": "Write a short summary of the decisions made earlier in this conversation about the caching strategy, for the user to paste into the team channel."
+    },
+    {
+      "id": "t10", "expect_tier": 1, "expect_provider": "claude", "expect_writes": true,
+      "title": "Update graph with new docs",
+      "description": "Run the graphify MCP tool to re-index docs/ and then update the architecture notes in graphify-out/ to reflect the new billing module."
+    },
+    {
+      "id": "t11", "expect_tier": 1, "expect_provider": "codex", "expect_writes": false, "expect_risk": 0,
+      "title": "Review PR diff for style",
+      "description": "Review the diff on the current branch against main for naming, dead code, and obvious logic errors. Report findings, do not edit."
+    },
+    {
+      "id": "t12", "expect_tier": 1, "expect_provider": "codex", "expect_writes": true, "expect_risk": 2,
+      "title": "Drop legacy tables",
+      "description": "Write and run the migration that drops the legacy_orders and legacy_customers tables from the production database now that the backfill is verified."
+    }
+  ]
+}

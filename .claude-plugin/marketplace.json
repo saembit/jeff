@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "jeff",
+  "description": "Jev-routed multi-model orchestration for Claude Code: cheap work to cheap models, hard work to strong ones, verified.",
+  "owner": {
+    "name": "saembit",
+    "url": "https://github.com/saembit"
+  },
+  "plugins": [
+    {
+      "name": "jeff",
+      "description": "Jev picks model tier, provider (Claude or Codex), skill, sandbox, and parallelism per subtask. Verification escalates misses.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

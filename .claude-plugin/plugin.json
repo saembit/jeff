@@ -1,0 +1,32 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "jeff",
+  "version": "0.1.0",
+  "description": "Jev-routed multi-model orchestration. Jev (TypeSafe System One) picks the model tier, provider (Claude or Codex), skill, sandbox, and parallelism per subtask so cheap work goes to cheap models. Verification escalates misses one tier.",
+  "author": {
+    "name": "saembit",
+    "url": "https://github.com/saembit",
+    "email": "austinch20@protonmail.com"
+  },
+  "skills": [
+    "./",
+    "./skills"
+  ],
+  "agents": [
+    "./agents/codex-worker.md"
+  ],
+  "hooks": "./hooks/hooks.json",
+  "displayName": "jeff",
+  "homepage": "https://github.com/saembit/jeff",
+  "repository": "https://github.com/saembit/jeff",
+  "license": "MIT",
+  "keywords": [
+    "orchestration",
+    "routing",
+    "codex",
+    "typesafe",
+    "jev",
+    "multi-model",
+    "cost"
+  ]
+}

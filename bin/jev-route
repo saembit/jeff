@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+"""
+jev-route
+Sends a list of subtasks to Jev and prints a routing decision for each one
+
+Usage:
+  jev-route < subtasks.json
+  jev-route --task "one task description"
+  jev-route --dry-run < subtasks.json
+
+Input is {"subtasks": [...], "context": {...}} where each subtask has an id, title,
+description and optionally files and depends_on. Output is {"decisions": [...],
+"raw": {...}, "batches": n} where each decision has the tier, provider, model,
+effort, skill, sandbox, parallel_group, risk, require_approval, confidence and
+a fallback list of fields Jev wasn't sure about.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+# Make lib importable no matter where the script is run from
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from jevclient import JevError, argmax_level, ask, load_registry  # noqa: E402
+
+# File extensions mapped to a language name for the repo signals
+CODE_EXTENSIONS = {
+    ".py": "python", ".ts": "typescript", ".tsx": "typescript", ".js": "javascript",
+    ".go": "go", ".rs": "rust", ".java": "java", ".kt": "kotlin", ".rb": "ruby",
+    ".c": "c", ".h": "c", ".cpp": "cpp", ".cs": "csharp", ".php": "php",
+    ".geas": "geas", ".sh": "shell",
+}
+# Cap on files walked so big repos don't slow the hook down
+MAX_SIGNAL_FILES = 3000
+# Directories that never count as source
+SKIP_DIRS = {".git", "node_modules", ".venv", "target", "dist", "build"}
+
+
+def repo_signals(cwd: Path) -> dict[str, Any]:
+    """
+    repo_signals
+    Collects cheap facts about the working tree such as languages, tests, dirty files, etc.
+    @param cwd {Path} - the directory to look at
+    @return {dict} - the signals
+    """
+    # Count of files per language
+    counts: Counter[str] = Counter()
+    # Whether anything test like was seen
+    has_tests = False
+    # How many files were walked
+    seen = 0
+
+    try:
+        # Walk the tree until the cap is hit
+        for path in cwd.rglob("*"):
+            if seen >= MAX_SIGNAL_FILES:
+                break
+            # Skip vendored and build dirs
+            if any(part in SKIP_DIRS for part in path.parts):
+                continue
+            # Only files count
+            if path.is_file():
+                seen += 1
+                # Bump the language count if the extension is known
+                lang = CODE_EXTENSIONS.get(path.suffix)
+                if lang:
+                    counts[lang] += 1
+                # Anything named like a test flips the flag
+                if "test" in path.name.lower() or "tests" in path.parts or "spec" in path.name.lower():
+                    has_tests = True
+    except OSError:
+        # Unreadable dirs just stop the walk
+        pass
+
+    # Dirty file count from git if this is a repo
+    dirty = _git(cwd, "status", "--porcelain")
+
+    return {
+        "cwd": str(cwd),
+        "languages": [lang for lang, _ in counts.most_common(3)],
+        "code_files_sampled": seen,
+        "has_tests": has_tests,
+        "git_dirty_files": len(dirty.splitlines()) if dirty is not None else None,
+    }
+
+
+def _git(cwd: Path, *args: str) -> str | None:
+    """
+    _git
+    Runs a git command and returns stdout or None if it failed
+    @param cwd {Path} - the directory to run in
+    @param args {str} - the git arguments
+    @return {str | None} - stdout or None
+    """
+    try:
+        # Run git with a short timeout
+        out = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def build_questions(subtasks: list[dict[str, Any]], reg: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """
+    build_questions
+    Builds the set of Jev questions for every subtask in the batch
+    @param subtasks {list} - the subtasks in this batch
+    @param reg {dict} - the registry
+    @return {dict} - questions keyed by name_index
+    """
+    # The tier descriptions are the score levels for difficulty
+    tier_levels = [t["describe"] for t in reg["tiers"]]
+    # The skill catalog is the choice criteria
+    skills = reg["skills"]
+    # Questions get built here
+    questions: dict[str, dict[str, Any]] = {}
+
+    # One set of questions per subtask
+    for i, _ in enumerate(subtasks):
+        # How the question refers to this subtask in the state
+        ref = f"`subtasks[{i}]`"
+
+        # How hard the subtask is, one level per tier
+        questions[f"difficulty_{i}"] = {
+            "type": "score",
+            "instructions": f"How difficult is {ref} for a capable coding agent working in the repository described by `repo`? Judge the whole subtask, including investigation needed, not only the final edit.",
+            "criteria": tier_levels,
+        }
+        # How bad a wrong first attempt would be
+        questions[f"redo_cost_{i}"] = {
+            "type": "score",
+            "instructions": f"If the first attempt at {ref} were wrong, how costly would it be to detect and redo?",
+            "criteria": reg["redo_cost"],
+        }
+        # How risky the actions are outside the working tree
+        questions[f"risk_{i}"] = {
+            "type": "score",
+            "instructions": f"How risky are the actions {ref} implies, considering irreversibility and blast radius beyond the working tree?",
+            "criteria": reg["risk"],
+        }
+        # Whether a repo only cli agent could do it alone
+        questions[f"codex_suitable_{i}"] = {
+            "type": "noul",
+            "instructions": f"Can {ref} be handed to a separate non-interactive CLI coding agent that has only the repository on disk and the subtask text? Answer no if it needs the current conversation's context, the user's judgment mid-task, MCP tools, artifacts, or resources outside the repo.",
+            "criteria": {
+                "true": "Self-contained: a fresh agent with the repo and this text could complete it.",
+                "false": "Needs conversation context, user interaction, or tools beyond a repo-only coding agent.",
+            },
+        }
+        # Whether files get changed
+        questions[f"writes_{i}"] = {
+            "type": "noul",
+            "instructions": f"Does {ref} require creating, modifying, or deleting files in the repository?",
+        }
+        # Whether it has to wait on another subtask
+        questions[f"needs_sibling_{i}"] = {
+            "type": "noul",
+            "instructions": f"Does {ref} need the finished output of another entry in `subtasks` before it can start? Answer no when it could start now with the repository as it is.",
+        }
+        # Whether it would fight another subtask over the same files
+        questions[f"file_conflict_{i}"] = {
+            "type": "noul",
+            "instructions": f"Would {ref} probably edit the same files that another entry in `subtasks` edits, so that running both at once would produce conflicting changes? Use `files` fields when present; read-only subtasks never conflict.",
+        }
+        # Which skill fits best
+        questions[f"skill_{i}"] = {
+            "type": "choice",
+            "instructions": f"Which skill best fits {ref}? Pick `none` if no listed skill fits well.",
+            "criteria": skills,
+        }
+
+    return questions
+
+
+def decide(i: int, sub: dict[str, Any], answers: dict[str, Any], reg: dict[str, Any]) -> dict[str, Any]:
+    """
+    decide
+    Turns the answers for one subtask into a routing decision using the policy in the registry
+    @param i {int} - the index of the subtask in its batch
+    @param sub {dict} - the subtask
+    @param answers {dict} - all answers from the batch
+    @param reg {dict} - the registry
+    @return {dict} - the decision
+    """
+    # The policy thresholds
+    pol = reg["policy"]
+    # Fields Jev wasn't sure about get listed here
+    fallback: list[str] = []
+
+    # Most likely difficulty level and how sure Jev is
+    tier, tier_p = argmax_level(answers[f"difficulty_{i}"])
+    tier_conf = float(answers[f"difficulty_{i}"].get("confidence", tier_p))
+    # Flag the tier if confidence is under the floor
+    if tier_conf < pol["confidence_floor"]:
+        fallback.append("tier")
+
+    # Cheap to redo drops a tier, expensive to redo bumps one
+    redo, _ = argmax_level(answers[f"redo_cost_{i}"])
+    if redo == 0 and tier > 0:
+        tier -= 1
+    elif redo == 2 and tier < len(reg["tiers"]) - 1:
+        tier += 1
+
+    # The rest of the raw signals
+    risk, _ = argmax_level(answers[f"risk_{i}"])
+    codex_p = float(answers[f"codex_suitable_{i}"]["noul"])
+    writes_p = float(answers[f"writes_{i}"]["noul"])
+    sibling_p = float(answers[f"needs_sibling_{i}"]["noul"])
+    conflict_p = float(answers[f"file_conflict_{i}"]["noul"])
+    # Independent means it neither waits on nor collides with a sibling
+    indep_p = round(min(1.0 - sibling_p, 1.0 - conflict_p), 3)
+
+    # The skill choice and whether Jev was sure about it
+    skill_ans = answers[f"skill_{i}"]
+    skill = skill_ans["choice"]
+    if float(skill_ans.get("confidence", 0)) < pol["confidence_floor"]:
+        fallback.append("skill")
+
+    # Pick the provider from the policy and codex suitability
+    provider = choose_provider(tier, codex_p, pol)
+    # Codex with no skill gets a default skill for its tier
+    if provider == "codex" and skill == "none":
+        skill = default_codex_skill(tier, writes_p, pol)
+    # Claude never gets a codex skill
+    if provider == "claude" and skill.startswith("codex-"):
+        skill = "none"
+
+    # The tier config holds the model and effort per provider
+    tier_cfg = reg["tiers"][tier]
+    # An explicit depends_on always forces serial
+    depends = bool(sub.get("depends_on"))
+
+    return {
+        "id": sub.get("id", str(i)),
+        "title": sub.get("title", ""),
+        "tier": tier,
+        "tier_name": tier_cfg["name"],
+        "provider": provider,
+        "model": tier_cfg[provider]["model"],
+        "effort": tier_cfg[provider]["effort"],
+        "skill": skill,
+        "sandbox": "workspace-write" if writes_p >= pol["writes_min"] else "read-only",
+        "parallel_group": "parallel" if (indep_p >= pol["independent_min"] and not depends) else "serial",
+        "risk": risk,
+        "require_approval": risk >= 2,
+        "confidence": round(min(tier_conf, float(skill_ans.get("confidence", 1.0))), 3),
+        "fallback": fallback,
+        "signals": {
+            "difficulty": answers[f"difficulty_{i}"]["probabilities"],
+            "redo_cost": redo,
+            "codex_suitable": round(codex_p, 3),
+            "writes": round(writes_p, 3),
+            "needs_sibling": round(sibling_p, 3),
+            "file_conflict": round(conflict_p, 3),
+            "independent": indep_p,
+        },
+    }
+
+
+def choose_provider(tier: int, codex_p: float, pol: dict[str, Any]) -> str:
+    """
+    choose_provider
+    Picks claude or codex from the preference, the suitability and whether codex is installed
+    @param tier {int} - the tier after adjustments
+    @param codex_p {float} - probability the task is codex suitable
+    @param pol {dict} - the policy section of the registry
+    @return {str} - claude or codex
+    """
+    # The configured preference
+    pref = pol["provider_preference"]
+    # Whether the task is suitable enough for codex
+    suitable = codex_p >= pol["codex_suitable_min"]
+
+    # Claude when not suitable, preferred, or codex is missing
+    if not suitable or pref == "claude" or not codex_available():
+        return "claude"
+    # Balanced sends the cheap tiers to codex and the hard ones to claude
+    if pref == "balanced":
+        return "codex" if tier <= 1 else "claude"
+    return "codex"
+
+
+def codex_available() -> bool:
+    """
+    codex_available
+    Checks if the codex cli is on PATH
+    @return {bool} - true if found
+    """
+    return shutil.which("codex") is not None
+
+
+def default_codex_skill(tier: int, writes_p: float, pol: dict[str, Any]) -> str:
+    """
+    default_codex_skill
+    Picks a codex skill for the tier when Jev didn't pick one
+    @param tier {int} - the tier
+    @param writes_p {float} - probability the task writes files
+    @param pol {dict} - the policy section
+    @return {str} - the skill name
+    """
+    # Read only work goes to research
+    if writes_p < pol["writes_min"]:
+        return "codex-research"
+    # Otherwise the skill matches the tier
+    return {0: "codex-quick", 1: "codex-standard"}.get(tier, "codex-deep")
+
+
+def batches(subtasks: list[dict[str, Any]], limit: int) -> list[list[tuple[int, dict[str, Any]]]]:
+    """
+    batches
+    Splits the subtasks so each batch stays under the state size limit
+    @param subtasks {list} - all subtasks
+    @param limit {int} - max chars of serialized subtasks per batch
+    @return {list} - batches of (index, subtask) pairs
+    """
+    # The finished batches
+    out: list[list[tuple[int, dict[str, Any]]]] = []
+    # The batch being filled
+    current: list[tuple[int, dict[str, Any]]] = []
+    # Chars used by the current batch
+    size = 0
+
+    # Add subtasks until the limit would be crossed
+    for i, sub in enumerate(subtasks):
+        chunk = len(json.dumps(sub))
+        if current and size + chunk > limit:
+            out.append(current)
+            current, size = [], 0
+        current.append((i, sub))
+        size += chunk
+
+    # Don't lose the last batch
+    if current:
+        out.append(current)
+    return out
+
+
+def route(payload: dict[str, Any], *, dry_run: bool = False) -> dict[str, Any]:
+    """
+    route
+    Validates the payload, asks Jev per batch and builds the decisions
+    @param payload {dict} - the subtasks and optional context
+    @param dry_run = False {bool} - skip the api and return the questions instead
+    @return {dict} - decisions, batch count and raw usage
+    """
+    # The registry drives everything
+    reg = load_registry()
+    # The subtasks to route
+    subtasks = payload.get("subtasks") or []
+    if not subtasks:
+        raise JevError("no subtasks given")
+
+    # Every subtask needs some text to judge
+    for n, sub in enumerate(subtasks):
+        if not isinstance(sub, dict) or not (sub.get("description") or sub.get("title")):
+            raise JevError(f"subtask {n} needs a title or description")
+
+    # Context from the caller plus repo signals if they didn't give any
+    context = dict(payload.get("context") or {})
+    context.setdefault("repo", repo_signals(Path.cwd()))
+
+    # Decisions and raw info per batch
+    decisions: list[dict[str, Any]] = []
+    raw: dict[str, Any] = {}
+    # Split into batches under the state cap
+    groups = batches(subtasks, reg["jev"]["max_state_chars"])
+
+    # Ask Jev once per batch
+    for group in groups:
+        # The subtasks in this batch
+        local = [sub for _, sub in group]
+        # The state Jev sees
+        state = {"subtasks": local, "repo": context["repo"], **{k: v for k, v in context.items() if k != "repo"}}
+        # The questions for this batch
+        questions = build_questions(local, reg)
+
+        # Dry run just records what would be sent
+        if dry_run:
+            raw[f"batch_{len(raw)}"] = {"state": state, "questions": questions}
+            continue
+
+        # Ask and keep the usage
+        resp = ask(state, questions, registry=reg)
+        answers = resp["answers"]
+        raw[f"batch_{len(raw)}"] = {"usage": resp.get("usage"), "model": resp.get("model")}
+
+        # One decision per subtask in the batch
+        for local_i, (_, sub) in enumerate(group):
+            decisions.append(decide(local_i, sub, answers, reg))
+
+    return {"decisions": decisions, "batches": len(groups), "raw": raw}
+
+
+def main() -> int:
+    """
+    main
+    Parses args, reads the payload and prints the decisions as json
+    @return {int} - exit code
+    """
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--task", help="single task description instead of stdin JSON")
+    parser.add_argument("--dry-run", action="store_true", help="print state and questions without calling Jev")
+    args = parser.parse_args()
+
+    try:
+        # A single task gets wrapped as one subtask
+        if args.task:
+            payload = {"subtasks": [{"id": "t0", "title": args.task[:80], "description": args.task}]}
+        else:
+            payload = json.load(sys.stdin)
+        result = route(payload, dry_run=args.dry_run)
+    except json.JSONDecodeError as exc:
+        print(f"jev-route: invalid JSON on stdin: {exc}", file=sys.stderr)
+        return 2
+    except JevError as exc:
+        print(f"jev-route: {exc}", file=sys.stderr)
+        return 1
+
+    # Print the result as json on stdout
+    json.dump(result, sys.stdout, indent=2)
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
